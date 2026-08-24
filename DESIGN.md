@@ -6,39 +6,49 @@ Client layer is mocked via OpenAPI (`/docs`) and curl examples in the README.
 
 ## Architecture
 
-```mermaid
-flowchart LR
-  Client["Test harness / curl / OpenAPI"]
-  API["Spring Web REST"]
-  Avail["AvailabilityService"]
-  Book["BookingService"]
-  Engine["AvailabilityEngine"]
-  Repos["Spring Data JPA"]
-  DB["H2 file / Postgres"]
-  Obs["JSON logs + request ID + Prometheus"]
+Read left to right along the request path. Persistence sits under the services that touch the database. Observability is cross-cutting — not on the request path.
 
-  Client --> API
-  API --> Avail
-  API --> Book
-  Book --> Avail
-  Avail --> Engine
-  Book --> Engine
-  Avail --> Repos
+```mermaid
+flowchart TB
+  subgraph path["Request path"]
+    direction LR
+    Client["1 Client<br/>Test harness / curl / OpenAPI"]
+    API["2 SchedulerController<br/>Spring Web REST"]
+    Book["3 BookingService<br/>POST confirm"]
+    Avail["4 AvailabilityService<br/>GET diary + POST re-check"]
+    Engine["5 AvailabilityEngine<br/>pure domain"]
+    Client --> API
+    API -->|"POST /appointments"| Book
+    Book -->|"assign inside the tx"| Avail
+    API -->|"GET /availability"| Avail
+    Avail --> Engine
+  end
+
+  subgraph persist["Persistence"]
+    direction LR
+    Repos["6 Spring Data JPA + Flyway"]
+    DB[("7 H2 file / Postgres")]
+    Repos --> DB
+  end
+
+  Obs["8 Observability — JSON logs + request ID + Prometheus"]
+
   Book --> Repos
-  Repos --> DB
-  API --> Obs
-  Avail --> Obs
-  Book --> Obs
+  Avail --> Repos
+  path -.-> Obs
 ```
 
 ### Component roles
 
+Left to right, then persistence, then observability.
+
 | Component | Role |
 |---|---|
-| `SchedulerController` | HTTP contract, validation, status codes. No scheduling rules. |
-| `AvailabilityEngine` | Pure domain: half-open overlap, dealer hours, 30-minute grid, assignment. |
-| `AvailabilityService` | Loads dealership-scoped bays, qualified techs, and the day's busy intervals (three queries), then matches in memory. Used by **GET** and **POST**. |
-| `BookingService` | Desired-time confirm: integrity checks, lock dealership row, re-check availability inside the transaction, persist `Appointment`, idempotency. |
+| Client | Mocked service advisor: OpenAPI (`/docs`), curl, or the test harness. No real UI. |
+| `SchedulerController` | HTTP contract, validation, status codes. No scheduling rules. `GET /availability` → `AvailabilityService`. `POST /appointments` → `BookingService`. |
+| `BookingService` | Desired-time **confirm**: catalog duration, vehicle ownership, lock the dealership row, re-check availability inside the transaction, persist `Appointment`, idempotency. |
+| `AvailabilityService` | Loads dealership-scoped bays, qualified techs, and the day's busy intervals (three queries), then matches in memory. Used by **GET** (diary) and **POST** (assign). Does not reserve. |
+| `AvailabilityEngine` | Pure domain: half-open overlap, dealer hours, 30-minute grid, first free bay + qualified tech. No Spring, no SQL. |
 | JPA + Flyway | Schema and indexes. H2 file for the demo; same mappings target Postgres. |
 | Observability | `X-Request-ID`, JSON logs, `/metrics`, `/health`, `/ready`. |
 
@@ -193,12 +203,19 @@ Prometheus text at `GET /metrics`:
 
 ## How GenAI was used in design
 
-GenAI (Cursor) was treated as a **collaborator**, not an authority.
+GenAI was treated as a collaborator, not an authority, and not as a substitute for design. Implementation started only after the architecture was clear enough to write down and defend.
 
-1. **Direction:** Scenario A was chosen for the richest domain (dual-resource booking + races). The Java/Spring stack was selected after the environment had Maven but no Python, and to match a typical Keyloop JVM service.
-2. **Challenge:** two review personas (meticulous client, solution architect) attacked assumptions and NFRs *before* coding. Their conditions (desired-time POST, ownership, one engine, timezone, idempotency, metrics-not-optional) were merged into this document and the code.
-3. **Verification:** I owned overlap semantics, transaction locking, and tests. Generated code was compiled and run; concurrency is asserted as `{201, 409}`, not hoped for.
-4. **What I rejected:** optional metrics, async SQLite, cartesian SQL, caching availability, shipping OpenTelemetry in the take-home.
+A large part of the design phase was thinking, not prompting. Direction came first, for example: Scenario A (resource-constrained booking of a bay and a qualified technician), backend-only, REST plus a persistent store, client mocked. Research followed that direction, then chose the tech stack suitable for it.
+
+The prompts I used were not just “build this.” They were closer to: this is the intent; how would you approach it; what is missing; what are the alternatives; where does this fail? The model was allowed to change a decision when the argument was sound, and suggestions were rejected when they violated ownership or the booking model. The goal was to stress-test the design, not to make the model agree.
+
+Once the direction was stable, it was written down so the model could not silently rewrite it. DESIGN.md is the record of decisions: if approach A was dropped for B, the reason stays in the document. The same notes cover request flow, endpoints, data movement, service boundaries, and failure behaviour. That document is the source of truth. The model was then asked to quiz me on the system and not on syntax.
+
+Before code, the model was asked how the system breaks: races on the same slot, inconsistent diary vs confirm, retries, missing auth (assessment assumption), and edge cases on hours and grid. Some answers were noise; some were kept (one engine for GET and POST, duration from the catalogue, half-open intervals, pessimistic lock, idempotency, metrics in scope). Optional metrics, nested per-slot SQL, caching availability as truth, and shipping an OpenTelemetry SDK in the take-home were rejected.
+
+Only after that pool existed was the model used to write the implementation. The cost of generating code is low; the cost of deciding whether that code should exist is not. GenAI made the unhappy path, as well as the happy path, cheaper to explore.
+
+The model is good at turning a specification into code. Responsibility stays on defining what must be compiled: what exists, why, constraints, trade-offs, what must never happen (double-book a bay or technician), and how correctness is shown. System design is that specification. GenAI compiles it. It does not choose the architecture.
 
 ## Out of scope
 
